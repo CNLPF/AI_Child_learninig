@@ -26,12 +26,13 @@
   canvas {
     display: block;
     image-rendering: pixelated;
+    outline: none;
   }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <canvas id="game" width="960" height="540"></canvas>
+  <canvas id="game" width="960" height="540" tabindex="0"></canvas>
 </div>
 
 <script>
@@ -135,6 +136,7 @@
   let state = 'play';   // 'play' | 'win'
   let respawnFlash = 0;
   let elapsed = 0;
+  let winLock = 0;      // 通关后的输入锁定期（帧）：防止"按住方向键冲线"的残留重复事件立刻重开
 
   // ===== 怪物与能力状态 =====
   let enemies = [];
@@ -170,6 +172,7 @@
     state = 'play';
     respawnFlash = 0;
     elapsed = 0;
+    winLock = 0;
   }
 
   function respawn() {
@@ -187,34 +190,104 @@
   }
 
   // ===== 输入 =====
-  // 注意：必须用 e.code 而不是 e.key。
-  // 中文输入法激活时，按 R 的 e.key 会变成 'Process'（且 isComposing=true），
-  // 导致 e.key==='r' 判断失效 —— 这就是「通关后按 R 没反应」的真实原因。
-  // e.code 是物理键位，不受输入法、大小写锁定、键盘布局影响。
+  // 【为什么这里写了两套判断】
+  // 第一版用 e.key === 'r' → 中文输入法激活时 e.key 变成 'Process'，失效。
+  // 第二版改成 e.code === 'KeyR' → 实测仍有输入法组合会让 e.code 变成空字符串，还是失效。
+  // 所以现在三重兜底：
+  //   ① e.code === 'KeyR'        正常情况
+  //   ② e.keyCode === 82         老式键码，输入法通常不改它
+  //   ③ e.key 小写后等于 'r'     无输入法时
+  // 只要任一条件成立就重开。另外画布还支持"点击重开"，完全绕开键盘。
+
+  function isKey(e, codeName, vk) {
+    if (e.code === codeName) return true;
+    if (e.keyCode === vk) return true;
+    return false;
+  }
+
+  function wantsRestart(e) {
+    if (e.code === 'KeyR') return true;
+    if (e.keyCode === 82) return true;
+    if (typeof e.key === 'string' && e.key.toLowerCase() === 'r') return true;
+    return false;
+  }
+
+  // 【判定"这是不是游戏操作键"】
+  // 通关瞬间玩家往往还按着方向键/空格。这类键不能当作"任意键继续"，
+  // 否则成绩画面一闪就被重开，根本来不及看。
+  const GAME_KEYS = {
+    ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1,
+    Space: 1, KeyA: 1, KeyD: 1, KeyW: 1, KeyS: 1
+  };
+  const GAME_VK = { 37: 1, 38: 1, 39: 1, 40: 1, 32: 1, 65: 1, 68: 1, 87: 1, 83: 1 };
+
+  function isGameplayKey(e) {
+    if (e.code && GAME_KEYS[e.code]) return true;
+    if (e.keyCode && GAME_VK[e.keyCode]) return true;
+    return false;
+  }
+
   document.addEventListener('keydown', function (e) {
-    const c = e.code;
-    if (c === 'ArrowLeft' || c === 'KeyA') { keys.left = true; e.preventDefault(); }
-    if (c === 'ArrowRight' || c === 'KeyD') { keys.right = true; e.preventDefault(); }
-    if (c === 'ArrowUp' || c === 'KeyW' || c === 'Space') {
+    // 【最关键的一层：通关界面上，按 R 或"任意非操作键"都算继续】
+    // 原因：输入法彻底接管按键时，浏览器会给出 code=''、key='Process'、keyCode=229，
+    // 页面根本无从得知用户按的是哪个键。此时任何"精确匹配 R"的判断都不可能成立。
+    // 所以放宽：只要不是方向键/跳跃键，就当作"玩家想继续"。
+    if (state === 'win') {
+      // 排除三类"假按键"，否则会误触：
+      //   ① e.repeat === true        按住键时的自动重复
+      //   ② winLock > 0              刚到终点的那一小段时间
+      //   ③ 方向键 / 跳跃键          玩家冲线时还按着的键
+      if (!e.repeat && winLock <= 0 && !isGameplayKey(e)) {
+        e.preventDefault();
+        resetLevel();
+      }
+      return;
+    }
+
+    // 游戏中：只有 R 才重开（避免误触），三重判断兜底
+    if (wantsRestart(e)) { e.preventDefault(); resetLevel(); return; }
+
+    if (isKey(e, 'ArrowLeft', 37) || isKey(e, 'KeyA', 65)) { keys.left = true; e.preventDefault(); }
+    if (isKey(e, 'ArrowRight', 39) || isKey(e, 'KeyD', 68)) { keys.right = true; e.preventDefault(); }
+    if (isKey(e, 'ArrowUp', 38) || isKey(e, 'KeyW', 87) || isKey(e, 'Space', 32)) {
       keys.jump = true;
       if (!jumpHeld) { jumpBuffer = 8; jumpHeld = true; }
       e.preventDefault();
     }
-    if (c === 'KeyR') { resetLevel(); }
   });
 
   document.addEventListener('keyup', function (e) {
-    const c = e.code;
-    if (c === 'ArrowLeft' || c === 'KeyA') keys.left = false;
-    if (c === 'ArrowRight' || c === 'KeyD') keys.right = false;
-    if (c === 'ArrowUp' || c === 'KeyW' || c === 'Space') {
+    if (isKey(e, 'ArrowLeft', 37) || isKey(e, 'KeyA', 65)) keys.left = false;
+    if (isKey(e, 'ArrowRight', 39) || isKey(e, 'KeyD', 68)) keys.right = false;
+    if (isKey(e, 'ArrowUp', 38) || isKey(e, 'KeyW', 87) || isKey(e, 'Space', 32)) {
       keys.jump = false;
       jumpHeld = false;
     }
   });
 
-  // 输入法组合期间不吞按键：composition 事件不阻止 keydown，但部分浏览器会暂停 keydown。
-  // 兜底：若窗口失焦，清空所有按键状态，避免"按键卡住"导致角色一直跑。
+  // 【兜底入口：鼠标/触摸】
+  // 键盘在某些环境下拿不到（浏览器扩展抢占、输入法深度接管、焦点在画布外等）。
+  // 所以让画布本身也能重开：仅在通关画面下生效，避免游戏中误点打断。
+  // 这条路径完全不经过键盘事件。
+  function clickRestart(e) {
+    if (state === 'win' && winLock <= 0) {
+      e.preventDefault();
+      resetLevel();
+    }
+  }
+  canvas.addEventListener('mousedown', clickRestart);
+  canvas.addEventListener('touchstart', clickRestart, { passive: false });
+
+  // 【iframe / 预览面板里的焦点问题】
+  // 本文件经常被嵌在预览面板的 iframe 里打开。iframe 未获得焦点时，
+  // 键盘事件根本不会进到这个 document，R 键看上去就"完全没反应"。
+  // 对策：加载即主动抢焦点；鼠标进入画布或点击时再抢一次。
+  canvas.focus();
+  window.focus();
+  canvas.addEventListener('mouseenter', function () { canvas.focus(); });
+  canvas.addEventListener('mousedown', function () { canvas.focus(); });
+
+  // 失焦时清空按键，避免"按键卡住"导致角色一直跑
   window.addEventListener('blur', function () {
     keys.left = false; keys.right = false; keys.jump = false; jumpHeld = false;
   });
@@ -228,6 +301,8 @@
 
   // ===== 更新 =====
   function updatePhysics() {
+    // winLock 必须在"提前返回"之前递减，否则通关后它永远是正数，锁死解不开
+    if (winLock > 0) winLock--;
     if (state === 'win') return;
     elapsed += 1 / 60;
 
@@ -315,7 +390,10 @@
     }
 
     // 到达终点
-    if (overlap(player, GOAL)) { state = 'win'; }
+    if (overlap(player, GOAL)) {
+      state = 'win';
+      winLock = 45;             // 锁 45 帧（约 0.75 秒）：玩家还在按方向键，别立刻重开
+    }
 
     if (respawnFlash > 0) respawnFlash--;
     updateEnemies();
@@ -928,20 +1006,34 @@
     ctx.fillStyle = '#81c784';
     ctx.fillText('用时 ' + elapsed.toFixed(1) + ' 秒', W / 2, H / 2 + 86);
 
-    // 重开提示（做成明显的按钮样式，避免玩家以为没反应）
-    const bw = 300, bh = 56, bx = W / 2 - bw / 2, by = H / 2 + 116;
+    // 重开按钮（做成明显的按钮样式，避免玩家以为没反应）
+    const bw = 340, bh = 56, bx = W / 2 - bw / 2, by = H / 2 + 116;
+    const locked = winLock > 0;
     const pulse = 0.5 + Math.sin(t * 4) * 0.5;
+
     ctx.beginPath();
     roundRect(ctx, bx, by, bw, bh, 14);
-    ctx.fillStyle = 'rgba(255,217,59,' + (0.15 + pulse * 0.2) + ')';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255,217,59,' + (0.6 + pulse * 0.4) + ')';
+    if (locked) {
+      // 锁定期：暗色，明确告诉玩家"马上就能点"
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    } else {
+      ctx.fillStyle = 'rgba(255,217,59,' + (0.15 + pulse * 0.2) + ')';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,217,59,' + (0.6 + pulse * 0.4) + ')';
+    }
     ctx.lineWidth = 2.5;
     ctx.stroke();
 
-    ctx.fillStyle = '#ffd93b';
+    ctx.fillStyle = locked ? 'rgba(255,255,255,0.45)' : '#ffd93b';
     ctx.font = 'bold 24px "PingFang SC","Microsoft YaHei",sans-serif';
-    ctx.fillText('按 R 重新挑战', W / 2, by + bh / 2 + 1);
+    ctx.fillText(locked ? '稍等一下下…' : '按任意键 或 点这里 重新挑战', W / 2, by + bh / 2 + 1);
+
+    // 键盘万一失效的说明
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '16px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('（键盘没反应时，直接用鼠标点上面的按钮）', W / 2, by + bh + 34);
 
     ctx.textAlign = 'left';
   }
