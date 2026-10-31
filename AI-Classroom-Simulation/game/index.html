@@ -91,6 +91,27 @@
 
   const SPAWN = { x: 80, y: 360 };
 
+  // ===== 怪物配置 =====
+  // 巡逻型怪物：在出生点左右 patrol 范围内来回走，遇墙或到边界掉头。
+  // y 计算规则：站在地面上 → y = 460 - 34 = 426；站在平台(270)上 → y = 270 - 34 = 236。
+  // patrol 范围已核算过，保证不会走出地面/平台边缘（怪物无重力，走出边缘会悬空）。
+  const ENEMY_SEEDS = [
+    { x: 640,  y: 426, patrol: 90, speed: 0.85 },   // 地面·出生点后
+    { x: 1250, y: 426, patrol: 110, speed: 0.95 },  // 地面·坑后第一段
+    { x: 1440, y: 236, patrol: 30, speed: 0.7 },    // 平台(1400,270,150宽)上，范围受限
+    { x: 1900, y: 426, patrol: 120, speed: 1.05 },  // 地面
+    { x: 2200, y: 426, patrol: 70, speed: 0.9 },    // 地面·坑前
+    { x: 2600, y: 426, patrol: 130, speed: 1.0 },   // 地面·末段
+    { x: 2820, y: 426, patrol: 85, speed: 0.95 }    // 地面·旗杆前
+  ];
+
+  const ENEMY_W = 36;
+  const ENEMY_H = 34;
+
+  // 踩踏判定：玩家下落速度 > 该阈值且脚底在怪物上半部，才算"踩中"
+  const STOMP_MIN_VY = 1.2;
+  const STOMP_BOUNCE = -11.5;     // 踩中后的弹跳速度
+
   // ===== 吉祥物精灵图 =====
   // 采用内嵌 data URI：避免 file:// 协议下加载外部图片导致的画布跨域污染（canvas tainted），
   // 同时保证整个游戏是真正可单文件分发的（拷到桌面双击就能玩，无路径依赖）。
@@ -115,9 +136,25 @@
   let respawnFlash = 0;
   let elapsed = 0;
 
+  // ===== 怪物与能力状态 =====
+  let enemies = [];
+  let stomped = 0;          // 累计踩死怪物数
+  let powerLevel = 0;       // 0=普通  1=强化（踩死怪物获得的奖励，可叠加至高亮状态）
+  let hurtInvuln = 0;       // 受伤无敌帧（帧数）
+  let hurtStun = 0;         // 受伤硬直：期间不能踩死怪物（防止奖励被刷回去）
+  let popups = [];          // 飘字提示（+1、被击中）
+
   function resetLevel() {
     coins = coinSeeds.map(function (c) {
       return { x: c.x, y: c.y, r: 11, taken: false };
+    });
+    enemies = ENEMY_SEEDS.map(function (e) {
+      return {
+        x: e.x, y: e.y, w: ENEMY_W, h: ENEMY_H,
+        vx: e.speed, face: 1,
+        originX: e.x, patrol: e.patrol, speed: e.speed,
+        alive: true, squash: 0        // squash>0 表示被踩扁后的残留动画帧
+      };
     });
     player = {
       x: SPAWN.x, y: SPAWN.y, w: 32, h: 44,
@@ -125,6 +162,11 @@
     };
     cam.x = 0;
     collected = 0;
+    stomped = 0;
+    powerLevel = 0;
+    hurtInvuln = 0;
+    hurtStun = 0;
+    popups = [];
     state = 'play';
     respawnFlash = 0;
     elapsed = 0;
@@ -135,30 +177,46 @@
     player.y = SPAWN.y;
     player.vx = 0;
     player.vy = 0;
+    hurtInvuln = 60;      // 重生后给 1 秒无敌，避免一落地就被怪撞
     respawnFlash = 30;
   }
 
+  // 飘字
+  function addPopup(x, y, text, color) {
+    popups.push({ x: x, y: y, text: text, color: color || '#fff', life: 60, vy: -1.1 });
+  }
+
   // ===== 输入 =====
+  // 注意：必须用 e.code 而不是 e.key。
+  // 中文输入法激活时，按 R 的 e.key 会变成 'Process'（且 isComposing=true），
+  // 导致 e.key==='r' 判断失效 —— 这就是「通关后按 R 没反应」的真实原因。
+  // e.code 是物理键位，不受输入法、大小写锁定、键盘布局影响。
   document.addEventListener('keydown', function (e) {
-    const k = e.key;
-    if (k === 'ArrowLeft' || k === 'a' || k === 'A') { keys.left = true; e.preventDefault(); }
-    if (k === 'ArrowRight' || k === 'd' || k === 'D') { keys.right = true; e.preventDefault(); }
-    if (k === 'ArrowUp' || k === 'w' || k === 'W' || k === ' ') {
+    const c = e.code;
+    if (c === 'ArrowLeft' || c === 'KeyA') { keys.left = true; e.preventDefault(); }
+    if (c === 'ArrowRight' || c === 'KeyD') { keys.right = true; e.preventDefault(); }
+    if (c === 'ArrowUp' || c === 'KeyW' || c === 'Space') {
       keys.jump = true;
       if (!jumpHeld) { jumpBuffer = 8; jumpHeld = true; }
       e.preventDefault();
     }
-    if (k === 'r' || k === 'R') { resetLevel(); }
+    if (c === 'KeyR') { resetLevel(); }
   });
 
   document.addEventListener('keyup', function (e) {
-    const k = e.key;
-    if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.left = false;
-    if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.right = false;
-    if (k === 'ArrowUp' || k === 'w' || k === 'W' || k === ' ') {
+    const c = e.code;
+    if (c === 'ArrowLeft' || c === 'KeyA') keys.left = false;
+    if (c === 'ArrowRight' || c === 'KeyD') keys.right = false;
+    if (c === 'ArrowUp' || c === 'KeyW' || c === 'Space') {
       keys.jump = false;
       jumpHeld = false;
     }
+  });
+
+  // 输入法组合期间不吞按键：composition 事件不阻止 keydown，但部分浏览器会暂停 keydown。
+  // 兜底：若窗口失焦，清空所有按键状态，避免"按键卡住"导致角色一直跑。
+  window.addEventListener('blur', function () {
+    keys.left = false; keys.right = false; keys.jump = false; jumpHeld = false;
   });
 
   // ===== 工具 =====
@@ -260,6 +318,98 @@
     if (overlap(player, GOAL)) { state = 'win'; }
 
     if (respawnFlash > 0) respawnFlash--;
+    updateEnemies();
+    updatePopups();
+  }
+
+  // ===== 怪物更新 =====
+  function updateEnemies() {
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+
+      // 被踩扁的残留动画
+      if (e.squash > 0) {
+        e.squash--;
+        if (e.squash === 0) e.alive = false;
+        continue;
+      }
+      if (!e.alive) continue;
+
+      // 巡逻移动
+      e.x += e.vx;
+      e.face = e.vx > 0 ? 1 : -1;
+
+      // 到达巡逻边界 → 掉头
+      if (e.x < e.originX - e.patrol) {
+        e.x = e.originX - e.patrol;
+        e.vx = Math.abs(e.vx);
+      } else if (e.x + e.w > e.originX + e.patrol + e.w) {
+        e.x = e.originX + e.patrol;
+        e.vx = -Math.abs(e.vx);
+      }
+
+      // 撞到关卡片段墙壁则掉头（简单处理：遇到实心块侧面就反向）
+      for (let b = 0; b < solidBlocks.length; b++) {
+        const blk = solidBlocks[b];
+        if (overlap(e, blk)) {
+          // 从块的哪一侧来的，就退回去
+          if (e.vx > 0) e.x = blk.x - e.w;
+          else e.x = blk.x + blk.w;
+          e.vx = -e.vx;
+          break;
+        }
+      }
+
+      // 与玩家判定
+      if (overlap(player, e)) {
+        const playerBottomPrev = player.y + player.h - player.vy;
+
+        // 判定"踩中"：玩家在下落，且上一帧脚底还在怪物上半部之上
+        // hurtStun > 0 时（受伤硬直）不允许踩死，防止"被撞飞→落到怪头上→又把能力加回来"
+        const isStomping = hurtStun <= 0 &&
+                           player.vy > STOMP_MIN_VY &&
+                           playerBottomPrev <= e.y + e.h * 0.6;
+
+        if (isStomping) {
+          // 踩死：怪物进入压扁动画，玩家弹起
+          e.squash = 22;
+          player.vy = STOMP_BOUNCE;
+          player.onGround = false;
+          stomped++;
+
+          // ===== 奖励：踩死怪物获得能力强化 =====
+          powerLevel = Math.min(powerLevel + 1, 3);
+          addPopup(e.x + e.w / 2, e.y - 10, '能力 +1', '#ffd93b');
+        } else if (hurtInvuln <= 0) {
+          // 侧碰受伤：扣能力等级，无能力则弹回起点
+          if (powerLevel > 0) {
+            powerLevel--;
+            hurtInvuln = 70;
+            hurtStun = 20;          // 受伤硬直：期间不能踩死怪物，防止"被撞飞→落到怪头上→又加回来"
+            // 击退：向后 + 轻微向下，避免玩家弹到怪物头顶
+            const dir = player.x + player.w / 2 < e.x + e.w / 2 ? -1 : 1;
+            player.vx = dir * 7;
+            player.vy = -4.2;
+            player.onGround = false;
+            addPopup(player.x + player.w / 2, player.y - 8, '能力 -1', '#ff8a65');
+          } else {
+            respawn();
+            addPopup(e.x + e.w / 2, e.y - 10, '被击中了！', '#ff5252');
+          }
+        }
+      }
+    }
+  }
+
+  function updatePopups() {
+    for (let i = popups.length - 1; i >= 0; i--) {
+      const p = popups[i];
+      p.y += p.vy;
+      p.life--;
+      if (p.life <= 0) popups.splice(i, 1);
+    }
+    if (hurtInvuln > 0) hurtInvuln--;
+    if (hurtStun > 0) hurtStun--;
   }
 
   function updateCamera() {
@@ -393,6 +543,122 @@
     }
   }
 
+  // ===== 怪物绘制 =====
+  // 造型：紫色小怪，有眼睛和尖牙，踩中时压扁。
+  function drawEnemies(t) {
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (!e.alive && e.squash === 0) continue;
+      const sx = e.x - cam.x;
+      if (sx + e.w < -60 || sx > W + 60) continue;
+
+      const isSquashed = e.squash > 0;
+      // 压扁比例：从 1 压到 0.32
+      const sq = isSquashed ? 0.32 + (e.squash / 22) * 0.68 : 1;
+      const drawH = e.h * sq;
+      const drawY = e.y + e.h - drawH;
+
+      ctx.save();
+      // 影子
+      ctx.beginPath();
+      ctx.ellipse(sx + e.w / 2, e.y + e.h, e.w * 0.42, 4, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0,0,0,0.16)';
+      ctx.fill();
+
+      // 走路摇摆
+      const wobble = isSquashed ? 0 : Math.sin(t * 8 + i) * 1.4;
+
+      // 身体（圆角矩形 + 底部两脚）
+      ctx.fillStyle = '#8e5bd4';
+      roundRect(ctx, sx, drawY + wobble, e.w, drawH, 9);
+      ctx.fill();
+      // 高光
+      ctx.fillStyle = '#a974e8';
+      roundRect(ctx, sx + 3, drawY + 3 + wobble, e.w - 6, drawH * 0.45, 7);
+      ctx.fill();
+
+      if (!isSquashed) {
+        // 脚
+        ctx.fillStyle = '#6d3fb0';
+        const step = Math.sin(t * 8 + i) * 2.5;
+        ctx.beginPath();
+        ctx.ellipse(sx + 9, e.y + e.h - 1 + step, 7, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.ellipse(sx + e.w - 9, e.y + e.h - 1 - step, 7, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 眼睛（朝向跟随移动方向）
+        const eyeOff = e.face * 2;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(sx + e.w / 2 - 7 + eyeOff, drawY + drawH * 0.38 + wobble, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(sx + e.w / 2 + 7 + eyeOff, drawY + drawH * 0.38 + wobble, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#2a1840';
+        ctx.beginPath();
+        ctx.arc(sx + e.w / 2 - 7 + eyeOff * 1.6, drawY + drawH * 0.38 + wobble, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(sx + e.w / 2 + 7 + eyeOff * 1.6, drawY + drawH * 0.38 + wobble, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 尖牙嘴
+        ctx.fillStyle = '#2a1840';
+        ctx.beginPath();
+        ctx.ellipse(sx + e.w / 2, drawY + drawH * 0.68 + wobble, 7, 4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.moveTo(sx + e.w / 2 - 5, drawY + drawH * 0.66 + wobble);
+        ctx.lineTo(sx + e.w / 2 - 2.5, drawY + drawH * 0.78 + wobble);
+        ctx.lineTo(sx + e.w / 2, drawY + drawH * 0.66 + wobble);
+        ctx.closePath();
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(sx + e.w / 2 + 1, drawY + drawH * 0.66 + wobble);
+        ctx.lineTo(sx + e.w / 2 + 3.5, drawY + drawH * 0.78 + wobble);
+        ctx.lineTo(sx + e.w / 2 + 5, drawY + drawH * 0.66 + wobble);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        // 被踩扁：X 形眼睛
+        ctx.strokeStyle = '#2a1840';
+        ctx.lineWidth = 2;
+        const ey = drawY + drawH * 0.5;
+        [-8, 8].forEach(function (dx) {
+          ctx.beginPath();
+          ctx.moveTo(sx + e.w / 2 + dx - 3, ey - 3);
+          ctx.lineTo(sx + e.w / 2 + dx + 3, ey + 3);
+          ctx.moveTo(sx + e.w / 2 + dx + 3, ey - 3);
+          ctx.lineTo(sx + e.w / 2 + dx - 3, ey + 3);
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawPopups() {
+    for (let i = 0; i < popups.length; i++) {
+      const p = popups[i];
+      const a = Math.min(1, p.life / 30);
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.font = 'bold 20px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillText(p.text, p.x - cam.x + 1, p.y + 1);
+      ctx.fillStyle = p.color;
+      ctx.fillText(p.text, p.x - cam.x, p.y);
+      ctx.restore();
+    }
+    ctx.textAlign = 'left';
+  }
+
   function drawGoal(t) {
     const sx = GOAL.x - cam.x;
     if (sx < -80 || sx > W + 80) return;
@@ -460,6 +726,23 @@
     if (!player.onGround) {
       const tilt = clamp(player.vy * 0.018, -0.22, 0.26);
       ctx.rotate(tilt * (player.face < 0 ? -1 : 1));
+    }
+
+    // 受伤无敌帧：半透明闪烁
+    if (hurtInvuln > 0 && Math.floor(hurtInvuln / 4) % 2 === 0) {
+      ctx.globalAlpha = 0.45;
+    }
+
+    // 能力强化光环（powerLevel 越高越明显）
+    if (powerLevel > 0) {
+      const glowR = 26 + powerLevel * 4;
+      const grd = ctx.createRadialGradient(0, -SPRITE_H * 0.5, 4, 0, -SPRITE_H * 0.5, glowR);
+      grd.addColorStop(0, 'rgba(255,217,59,' + (0.20 + powerLevel * 0.08) + ')');
+      grd.addColorStop(1, 'rgba(255,217,59,0)');
+      ctx.beginPath();
+      ctx.arc(0, -SPRITE_H * 0.5, glowR, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
     }
 
     ctx.imageSmoothingEnabled = true;
@@ -571,15 +854,47 @@
     ctx.fillText(collected + ' / ' + coins.length, 70, 43);
     ctx.restore();
 
-    // 操作提示
+    // 能力等级面板
     ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    roundRect(ctx, W - 300, 18, 282, 48, 12);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    roundRect(ctx, 18, 76, 168, 48, 12);
     ctx.fill();
     ctx.fillStyle = '#ffffff';
     ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
     ctx.textBaseline = 'middle';
-    ctx.fillText('← → 移动   空格 跳跃   R 重来', W - 282, 43);
+    ctx.fillText('能力', 32, 100);
+    // 三格能量条
+    for (let i = 0; i < 3; i++) {
+      const bx = 72 + i * 36, by = 90;
+      ctx.beginPath();
+      roundRect(ctx, bx, by, 30, 20, 5);
+      if (i < powerLevel) {
+        ctx.fillStyle = '#ffd93b';
+        ctx.fill();
+        ctx.strokeStyle = '#e0a800';
+      } else {
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+      }
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    // 踩怪计数
+    ctx.fillStyle = '#b0bec5';
+    ctx.font = '13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('踩扁 ' + stomped, 32, 112);
+    ctx.restore();
+
+    // 操作提示
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    roundRect(ctx, W - 316, 18, 298, 48, 12);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '15px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('← → 移动   空格 跳跃   R 重来', W - 298, 43);
     ctx.restore();
 
     // 掉坑闪红
@@ -587,23 +902,46 @@
       ctx.fillStyle = 'rgba(255,80,80,' + (respawnFlash / 30 * 0.28) + ')';
       ctx.fillRect(0, 0, W, H);
     }
+
+    // 受伤无敌帧：角色闪烁（半透明白罩提示）
+    if (hurtInvuln > 0 && Math.floor(hurtInvuln / 4) % 2 === 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.10)';
+      ctx.fillRect(0, 0, W, H);
+    }
   }
 
   function drawWin(t) {
-    ctx.fillStyle = 'rgba(10,20,40,0.72)';
+    ctx.fillStyle = 'rgba(10,20,40,0.78)';
     ctx.fillRect(0, 0, W, H);
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ffd93b';
     ctx.font = 'bold 64px "PingFang SC","Microsoft YaHei",sans-serif';
-    ctx.fillText('通关啦！', W / 2, H / 2 - 40);
+    ctx.fillText('通关啦！', W / 2, H / 2 - 60);
 
     ctx.fillStyle = '#ffffff';
     ctx.font = '26px "PingFang SC","Microsoft YaHei",sans-serif';
-    ctx.fillText('收集金币 ' + collected + ' / ' + coins.length, W / 2, H / 2 + 24);
-    ctx.font = '20px "PingFang SC","Microsoft YaHei",sans-serif';
-    ctx.fillStyle = '#b0bec5';
-    ctx.fillText('用时 ' + elapsed.toFixed(1) + ' 秒 · 按 R 重新挑战', W / 2, H / 2 + 70);
+    ctx.fillText('收集金币 ' + collected + ' / ' + coins.length, W / 2, H / 2 + 4);
+    ctx.fillText('踩扁怪物 ' + stomped + ' 只', W / 2, H / 2 + 42);
+
+    ctx.font = '22px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#81c784';
+    ctx.fillText('用时 ' + elapsed.toFixed(1) + ' 秒', W / 2, H / 2 + 86);
+
+    // 重开提示（做成明显的按钮样式，避免玩家以为没反应）
+    const bw = 300, bh = 56, bx = W / 2 - bw / 2, by = H / 2 + 116;
+    const pulse = 0.5 + Math.sin(t * 4) * 0.5;
+    ctx.beginPath();
+    roundRect(ctx, bx, by, bw, bh, 14);
+    ctx.fillStyle = 'rgba(255,217,59,' + (0.15 + pulse * 0.2) + ')';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,217,59,' + (0.6 + pulse * 0.4) + ')';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffd93b';
+    ctx.font = 'bold 24px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('按 R 重新挑战', W / 2, by + bh / 2 + 1);
 
     ctx.textAlign = 'left';
   }
@@ -638,7 +976,9 @@
     drawGoal(clock);
     drawBlocks();
     drawCoins(clock);
+    drawEnemies(clock);
     drawPlayer();
+    drawPopups();
     drawHUD();
     if (state === 'win') drawWin(clock);
 
