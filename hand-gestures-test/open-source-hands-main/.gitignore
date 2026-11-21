@@ -1,0 +1,9 @@
+node_modules
+dist/
+public/wasm/
+test-results/
+output/
+.playwright-cli/
+coverage/
+*.log
+.DS_Store
