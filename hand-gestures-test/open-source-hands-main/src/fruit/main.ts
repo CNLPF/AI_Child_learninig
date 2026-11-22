@@ -120,6 +120,9 @@ let nextLeafAt = 0;
 
 const keys = new Set<string>();
 const bot = new URLSearchParams(location.search).has('bot');
+const mobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+  || (navigator.maxTouchPoints > 1 && window.matchMedia('(pointer: coarse)').matches)
+  || window.innerWidth <= 760;
 
 function setStatus(text: string): void {
   if (text === statusText) return;
@@ -766,7 +769,9 @@ function begin(next: Mode): void {
   $('welcome').style.display = 'none';
   $('gameover').hidden = true;
   syncModeButtons();
-  setStatus(next === 'mouse' ? '鼠标控制 · 按住划动切割' : '手势控制 · 小幅度移动即可覆盖全场');
+  setStatus(next === 'mouse'
+    ? (mobileDevice ? '触屏控制 · 按住拖动切割' : '鼠标控制 · 按住划动切割')
+    : '手势控制 · 小幅度移动即可覆盖全场');
 }
 
 function finishGame(): void {
@@ -1092,6 +1097,11 @@ function render(now: number): void {
 
 requestAnimationFrame(render);
 if (bot) begin('bot');
+else if (mobileDevice) {
+  $('mode-mouse').textContent = '触屏控制';
+  $('mouse').textContent = '进入触屏游戏';
+  begin('mouse');
+}
 
 Object.assign(window, {
   __fruit: {
