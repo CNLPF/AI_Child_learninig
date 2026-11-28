@@ -1,4 +1,5 @@
 import { listCameras, cameraError } from './camera';
+import { paintOrchard } from './scenery';
 import { GameAudio, type FruitSound } from './audio';
 import {
   createHands,
@@ -9,20 +10,25 @@ import {
   toScreen,
   type GestureFrame,
 } from '../kit';
-import { intersects, type Point } from './rules';
+import { bladeSpeed, hitTime, swingBonus, type BladeSample, type Point } from './rules';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const canvas = $<HTMLCanvasElement>('game');
 const ctx = canvas.getContext('2d')!;
+const scenery = $<HTMLCanvasElement>('scenery');
 const video = $<HTMLVideoElement>('video');
 const skeleton = $<HTMLCanvasElement>('skeleton');
 const skeletonCtx = skeleton.getContext('2d')!;
 const GESTURE_REGION = { x0: 0.26, x1: 0.74, y0: 0.1, y1: 0.76 };
 
 type Mode = 'none' | 'camera' | 'mouse' | 'bot';
-type FruitKind = 'apple' | 'orange' | 'lime' | 'watermelon';
+type FruitKind = FruitSound;
 type TargetKind = FruitKind | 'bomb';
 type TargetState = 'whole' | 'half';
+type RoundMode = 'classic' | 'arcade';
+const ARCADE_DURATION = 60_000;
+const SPAWN_INTERVAL_SCALE = 0.75;
+const MAX_WHOLE_TARGETS = 10;
 
 type Target = Point & {
   id: number;
@@ -36,6 +42,7 @@ type Target = Point & {
   side: number;
   cutAngle: number;
   life: number;
+  rarity?: 'gold' | 'ice';
 };
 
 type Particle = Point & {
@@ -75,14 +82,33 @@ const FRUIT_STYLES: Record<FruitKind, { rind: string; rindDark: string; flesh: s
   orange: { rind: '#ffad2f', rindDark: '#c66b16', flesh: '#ffdf7d', glow: '#ffd56e', seed: '#9c5f24' },
   lime: { rind: '#91ce55', rindDark: '#4e8c38', flesh: '#e4f69c', glow: '#c7ed7f', seed: '#3d6b32' },
   watermelon: { rind: '#438b50', rindDark: '#204d36', flesh: '#ff6c67', glow: '#ff9b7e', seed: '#391d1e' },
+  strawberry: { rind: '#ee365d', rindDark: '#8b1644', flesh: '#ffd3ca', glow: '#ff896f', seed: '#ffdc8e' },
+  kiwi: { rind: '#906740', rindDark: '#553b28', flesh: '#a7df5b', glow: '#d6a467', seed: '#29251c' },
 };
-const FRUIT_KINDS: FruitKind[] = ['apple', 'orange', 'lime', 'watermelon'];
+const FRUIT_KINDS = Object.keys(FRUIT_STYLES) as FruitKind[];
 const FLOW_DURATION = 7000;
 const FLOW_MAX = 100;
 const audio = new GameAudio();
 
 let mode: Mode = 'none';
 let active = false;
+let roundMode: RoundMode = 'classic';
+let roundTime = 0;
+let iceUntil = 0;
+let calibrating = false;
+let handSeenAt = 0;
+let lastTimer = -1;
+let best = 0;
+let cutCount = 0;
+let maxStreak = 0;
+let swingHits = 0;
+let maxSwing = 0;
+let lastFastSample = -Infinity;
+let activePointer: number | null = null;
+let gestureId: number | null = null;
+
+const pauseMenu = $<HTMLDialogElement>('pause-menu');
+const preview = document.querySelector<HTMLElement>('.preview')!;
 let score = 0;
 let lives = 3;
 let combo = 0;
@@ -91,16 +117,16 @@ let fruits: Target[] = [];
 let particles: Particle[] = [];
 let effectTexts: EffectText[] = [];
 let trail: (Point & { t: number })[] = [];
-let previous: (Point & { t: number }) | null = null;
+let previous: BladeSample | null = null;
 let cursor: Point | null = null;
 let slashFx: SlashFx | null = null;
 let last = 0;
 let spawnAt = 0;
 let nextTargetId = 1;
 let runId = 0;
-let pressed = false;
 let width = 1;
 let height = 1;
+let pixelRatio = 1;
 let skeletonWidth = 0;
 let skeletonHeight = 0;
 let statusText = '';
@@ -108,8 +134,10 @@ let statusHoldUntil = 0;
 let trauma = 0;
 let hitStopUntil = 0;
 let impactZoom = 0;
-let shakeEnabled = true;
-let soundEnabled = true;
+const motionPreference = readPreference('motion');
+let shakeEnabled = motionPreference ? motionPreference === 'on' : !matchMedia('(prefers-reduced-motion: reduce)').matches;
+let soundEnabled = readPreference('sound') !== 'off';
+let previewEnabled = true;
 let flowCharge = 0;
 let flowUntil = 0;
 let flowWasActive = false;
@@ -143,16 +171,50 @@ function holdStatus(text: string, holdMs = 800): void {
   setStatus(text);
 }
 
+function readPreference(key: string): string | null {
+  try { return localStorage.getItem('slice-arena:' + key); } catch { return null; }
+}
+
+function savePreference(key: string, value: string): void {
+  try { localStorage.setItem('slice-arena:' + key, value); } catch { /* Storage can be unavailable. */ }
+}
+
 function updateHud(): void {
   $('score').textContent = String(score);
+  $('best').textContent = String(best);
   $('lives').textContent = String(lives);
 }
 
-function isFlowActive(now = performance.now()): boolean {
+function updateTimer(): void {
+  if (roundMode !== 'arcade') return;
+  const seconds = Math.max(0, Math.ceil((ARCADE_DURATION - roundTime) / 1000));
+  if (seconds === lastTimer) return;
+  lastTimer = seconds;
+  $('timer').textContent = String(seconds);
+  $('timer-stat').classList.toggle('urgent', seconds <= 10);
+  if (active && seconds > 0 && seconds <= 5) audio.playCue('countdown');
+}
+
+function selectRound(next: RoundMode): void {
+  roundMode = next;
+  best = Number(readPreference('best:' + next)) || 0;
+  $('arcade').setAttribute('aria-pressed', String(next === 'arcade'));
+  $('classic').setAttribute('aria-pressed', String(next === 'classic'));
+  $('timer-stat').hidden = next !== 'arcade';
+  $('lives-stat').hidden = next !== 'classic';
+  $('round-rules').textContent = next === 'arcade'
+    ? '切水果得分，炸弹扣 30 分。60 秒内挑战最高分。'
+    : '避开炸弹，护盾用完时结算。';
+  lastTimer = -1;
+  updateTimer();
+  updateHud();
+}
+
+function isFlowActive(now = roundTime): boolean {
   return now < flowUntil;
 }
 
-function updateFlowHud(now = performance.now()): void {
+function updateFlowHud(now = roundTime): void {
   const running = isFlowActive(now);
   const percent = Math.round(running ? Math.max(0, Math.min(FLOW_MAX, ((flowUntil - now) / FLOW_DURATION) * FLOW_MAX)) : flowCharge);
   if (percent !== lastFlowPct) {
@@ -186,6 +248,8 @@ function clearBlade(): void {
   previous = null;
   trail = [];
   cursor = null;
+  swingHits = 0;
+  lastFastSample = -Infinity;
 }
 
 function fruitStyle(kind: FruitKind) {
@@ -202,6 +266,12 @@ function traceFruitShape(kind: FruitKind, radius: number): void {
     ctx.bezierCurveTo(radius * 0.82, -radius * 0.92, radius * 0.18, -radius * 0.9, 0, -radius * 0.62);
   } else if (kind === 'watermelon') {
     ctx.ellipse(0, radius * 0.04, radius * 1.16, radius * 0.82, -0.08, 0, Math.PI * 2);
+  } else if (kind === 'strawberry') {
+    ctx.moveTo(0, -radius * 0.66);
+    ctx.bezierCurveTo(-radius * 1.42, -radius * 1.12, -radius * 1.03, radius * 0.4, 0, radius);
+    ctx.bezierCurveTo(radius * 1.03, radius * 0.4, radius * 1.42, -radius * 1.12, 0, -radius * 0.66);
+  } else if (kind === 'kiwi') {
+    ctx.ellipse(0, 0, radius, radius * 0.8, 0, 0, Math.PI * 2);
   } else if (kind === 'lime') {
     ctx.ellipse(0, 0, radius * 0.9, radius, 0.18, 0, Math.PI * 2);
   } else {
@@ -244,13 +314,16 @@ function drawFruitBody(kind: FruitKind, radius: number): void {
   ctx.save();
   traceFruitShape(kind, radius);
   ctx.clip();
-  if (kind === 'orange') {
-    ctx.fillStyle = 'rgba(133,73,15,.25)';
+  if (kind === 'orange' || kind === 'strawberry' || kind === 'kiwi') {
+    ctx.fillStyle = kind === 'strawberry' ? style.seed : 'rgba(83,48,20,.3)';
     for (let i = 0; i < 22; i++) {
       const angle = i * 2.399;
       const distance = radius * (0.18 + ((i * 37) % 60) / 100);
       ctx.beginPath();
-      ctx.arc(Math.cos(angle) * distance, Math.sin(angle) * distance, Math.max(0.7, radius * 0.026), 0, Math.PI * 2);
+      ctx.ellipse(
+        Math.cos(angle) * distance, Math.sin(angle) * distance,
+        radius * (kind === 'strawberry' ? 0.055 : 0.028), radius * 0.022, angle, 0, Math.PI * 2,
+      );
       ctx.fill();
     }
   } else if (kind === 'watermelon') {
@@ -293,12 +366,24 @@ function drawFruitBody(kind: FruitKind, radius: number): void {
 
 function drawCutInterior(kind: FruitKind, radius: number): void {
   const style = fruitStyle(kind);
-  ctx.fillStyle = style.flesh;
+  const flesh = ctx.createRadialGradient(-radius * 0.18, -radius * 0.2, 1, 0, 0, radius);
+  flesh.addColorStop(0, '#fff2bf');
+  flesh.addColorStop(0.63, style.flesh);
+  flesh.addColorStop(1, style.rind);
+  ctx.fillStyle = flesh;
   ctx.beginPath();
-  ctx.ellipse(0, 0, radius * 0.84, radius * 0.88, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 0, radius * 0.84, radius * (kind === 'kiwi' ? 0.68 : 0.84), 0, 0, Math.PI * 2);
   ctx.fill();
 
-  if (kind === 'orange' || kind === 'lime') {
+  if (kind === 'kiwi' || kind === 'strawberry') {
+    ctx.fillStyle = kind === 'kiwi' ? '#28301d' : '#f8ddb3';
+    for (let i = 0; i < 15; i++) {
+      const angle = i * Math.PI * 2 / 15;
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(angle) * radius * 0.51, Math.sin(angle) * radius * 0.45, radius * 0.045, radius * 0.023, angle, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (kind === 'orange' || kind === 'lime') {
     ctx.strokeStyle = kind === 'orange' ? 'rgba(201,119,30,.55)' : 'rgba(77,132,48,.48)';
     ctx.lineWidth = 1.5;
     for (let i = 0; i < 8; i++) {
@@ -381,12 +466,12 @@ function drawBomb(radius: number, now: number): void {
 function drawTarget(target: Target, now: number): void {
   ctx.save();
   ctx.translate(target.x, target.y);
-  ctx.rotate(target.state === 'half' ? target.cutAngle : target.angle);
+  ctx.rotate(target.state === 'half' ? target.cutAngle + target.angle : target.angle);
   ctx.globalAlpha = target.state === 'half' ? Math.min(1, target.life * 2.3) : Math.min(1, target.life);
 
-  if (target.state === 'whole' && target.kind !== 'bomb' && isFlowActive(now)) {
+  if (target.state === 'whole' && target.kind !== 'bomb' && (target.rarity || isFlowActive())) {
     ctx.save();
-    ctx.strokeStyle = `rgba(255,235,151,${0.3 + Math.sin(now * 0.012) * 0.12})`;
+    ctx.strokeStyle = target.rarity === 'ice' ? '#a8ecff' : target.rarity === 'gold' ? '#ffe897' : 'rgba(255,235,151,.42)';
     ctx.lineWidth = 2;
     ctx.setLineDash([3, 7]);
     ctx.beginPath();
@@ -402,6 +487,12 @@ function drawTarget(target: Target, now: number): void {
   }
 
   if (target.state === 'whole') {
+    if (target.rarity) {
+      ctx.fillStyle = target.rarity === 'ice' ? '#a8ecff' : '#ffe897';
+      ctx.font = `700 ${target.r * 0.6}px system-ui`;
+      ctx.textAlign = 'center';
+      ctx.fillText(target.rarity === 'ice' ? '❄' : '✦', 0, -target.r * 1.38);
+    }
     drawFruitBody(target.kind, target.r);
     ctx.strokeStyle = '#9f7443';
     ctx.lineWidth = 3;
@@ -409,7 +500,14 @@ function drawTarget(target: Target, now: number): void {
     ctx.moveTo(0, -target.r * 0.72);
     ctx.lineTo(target.r * 0.08, -target.r * 1.08);
     ctx.stroke();
-    if (target.kind !== 'watermelon') drawLeaf(target.r, target.kind === 'orange' ? -1.02 : -0.82);
+    if (target.kind === 'strawberry') {
+      for (let i = 0; i < 3; i++) {
+        ctx.save();
+        ctx.rotate((i - 1) * 0.38);
+        drawLeaf(target.r * 0.78, -0.9);
+        ctx.restore();
+      }
+    } else if (target.kind !== 'watermelon') drawLeaf(target.r, target.kind === 'orange' ? -1.02 : -0.82);
     else {
       ctx.strokeStyle = '#4f8b4c';
       ctx.lineWidth = 2;
@@ -423,7 +521,7 @@ function drawTarget(target: Target, now: number): void {
 
   ctx.save();
   ctx.beginPath();
-  ctx.rect(-target.r - 8, target.side > 0 ? -target.r - 8 : 0, target.r * 2 + 16, target.r + 8);
+  ctx.rect(-target.r - 8, target.side < 0 ? -target.r - 8 : 0, target.r * 2 + 16, target.r + 8);
   ctx.clip();
   drawFruitBody(target.kind, target.r);
   drawCutInterior(target.kind, target.r);
@@ -440,24 +538,29 @@ function drawTarget(target: Target, now: number): void {
 }
 
 function drawTrail(): void {
-  trail = trail.filter((point) => performance.now() - point.t < 190);
+  trail = trail.filter((point) => performance.now() - point.t < 160);
   if (trail.length < 2) return;
   const flowing = isFlowActive();
+  const now = performance.now();
   ctx.save();
   ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.beginPath();
-  ctx.moveTo(trail[0].x, trail[0].y);
-  for (let i = 1; i < trail.length; i++) ctx.lineTo(trail[i].x, trail[i].y);
-  ctx.strokeStyle = flowing ? 'rgba(119,244,204,.24)' : 'rgba(255,185,87,.18)';
-  ctx.lineWidth = 18;
-  ctx.stroke();
-  ctx.strokeStyle = flowing ? 'rgba(226,255,196,.96)' : 'rgba(255,240,184,.9)';
-  ctx.lineWidth = 6;
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,.98)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
+  for (let i = 1; i < trail.length; i++) {
+    const end = trail[i];
+    const strength = Math.max(0, 1 - (now - end.t) / 160);
+    ctx.beginPath();
+    ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+    ctx.lineTo(end.x, end.y);
+    if (shakeEnabled) {
+      ctx.globalAlpha = strength * 0.34;
+      ctx.strokeStyle = flowing ? '#ffe480' : '#4fe8ef';
+      ctx.lineWidth = 14 * strength + 2;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = strength * 0.88;
+    ctx.strokeStyle = flowing ? '#fff6b1' : '#e7ffff';
+    ctx.lineWidth = 4 * strength + 1;
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -521,12 +624,12 @@ function drawAmbient(): void {
 }
 
 function addParticle(particle: Particle): void {
-  if (particles.length < 150) particles.push(particle);
+  if (particles.length < (shakeEnabled ? 150 : 65)) particles.push(particle);
 }
 
-function burstFruit(target: Target, cutAngle: number): void {
+function burstFruit(target: Target, cutAngle: number, special: boolean): void {
   const style = fruitStyle(target.kind as FruitKind);
-  for (let i = 0; i < 22; i++) {
+  for (let i = 0; i < (shakeEnabled ? (special ? 22 : 14) : 6); i++) {
     const angle = cutAngle + Math.PI / 2 * (i % 2 ? 1 : -1) + (Math.random() - 0.5) * 0.72;
     const speed = 80 + Math.random() * 210;
     addParticle({
@@ -535,7 +638,7 @@ function burstFruit(target: Target, cutAngle: number): void {
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed - 45,
       size: 2 + Math.random() * 4.2,
-      color: i % 3 ? style.flesh : style.rind,
+      color: special && i % 3 === 0 ? '#ffda72' : i % 3 ? style.flesh : style.rind,
       life: 0.45 + Math.random() * 0.38,
       maxLife: 0.83,
       kind: 'juice',
@@ -545,7 +648,7 @@ function burstFruit(target: Target, cutAngle: number): void {
 
 function burstBomb(target: Target): void {
   const colors = ['#fff2a2', '#ffbe4f', '#ff7549', '#ff3b37', '#d9e2e4'];
-  for (let i = 0; i < 38; i++) {
+  for (let i = 0; i < (shakeEnabled ? 32 : 10); i++) {
     const angle = Math.random() * Math.PI * 2;
     const speed = 90 + Math.random() * 390;
     addParticle({
@@ -565,7 +668,7 @@ function burstBomb(target: Target): void {
 function addEffectText(target: Target, text: string, color: string): void {
   effectTexts.push({
     x: target.x,
-    y: target.y - target.r,
+    y: target.y - target.r - 12,
     text,
     color,
     life: 0.72,
@@ -574,15 +677,26 @@ function addEffectText(target: Target, text: string, color: string): void {
 }
 
 function onFruitCut(target: Target, cutAngle: number): void {
-  const now = performance.now();
-  const flowActive = isFlowActive(now);
-  const gained = flowActive ? 2 : 1;
-  score += gained;
-  combo = now < comboUntil ? combo + 1 : 1;
-  comboUntil = now + 520;
+  const flowActive = isFlowActive();
+  const critical = roundMode === 'arcade' && !target.rarity && Math.random() < 0.05;
+  const special = critical || !!target.rarity;
+  const base = roundMode === 'classic' ? 1 : target.rarity === 'gold' ? 40 : critical ? 15 : 10;
+  if (target.rarity === 'ice' && roundTime >= iceUntil) {
+    iceUntil = roundTime + 5000;
+    holdStatus('冰冻果 · 减速 5 秒', 2000);
+  }
+  const gained = base * (flowActive ? 2 : 1);
+  swingHits += 1;
+  maxSwing = Math.max(maxSwing, swingHits);
+  const bonus = roundMode === 'arcade' ? swingBonus(swingHits) - swingBonus(swingHits - 1) : 0;
+  score += gained + bonus;
+  cutCount += 1;
+  combo = roundTime < comboUntil ? combo + 1 : 1;
+  comboUntil = roundTime + 900;
+  maxStreak = Math.max(maxStreak, combo);
   if (!flowActive) {
     flowCharge = Math.min(FLOW_MAX, flowCharge + 12 + Math.min(4, combo) * 2);
-    if (flowCharge >= FLOW_MAX) activateFlow(now);
+    if (flowCharge >= FLOW_MAX) activateFlow(roundTime);
   }
   updateHud();
 
@@ -593,73 +707,118 @@ function onFruitCut(target: Target, cutAngle: number): void {
       state: 'half',
       side,
       cutAngle,
+      x: target.x + Math.cos(normal) * side * 2.5,
+      y: target.y + Math.sin(normal) * side * 2.5,
       vx: target.vx + Math.cos(normal) * side * 145,
       vy: target.vy + Math.sin(normal) * side * 115 - 32,
-      spin: side * 1.4,
+      angle: 0,
+      spin: target.spin * 0.45 - side * 1.85,
       life: 0.88,
     });
   }
 
-  burstFruit(target, cutAngle);
-  addEffectText(target, combo >= 2 ? `×${combo}` : `+${gained}`, combo >= 2 ? '#efff9b' : '#fff3c8');
+  burstFruit(target, cutAngle, special);
+  const label = target.rarity === 'gold' ? '金果 ' : target.rarity === 'ice' ? '冰冻 ' : critical ? '暴击 ' : '';
+  const color = target.rarity === 'ice' ? '#a8ecff' : special ? '#ffe489' : '#fff3c8';
+  addEffectText(target, `${label}+${gained + bonus}`, color);
+  if (swingHits === 3) {
+    addEffectText({ ...target, x: width / 2, y: height * 0.28 }, '三果连切', '#a8ffff');
+    audio.playCue('combo');
+  } else if (combo === 5 || combo === 10 || combo === 20) {
+    holdStatus(`连续命中 ${combo} 次`);
+  }
   slashFx = { x: target.x, y: target.y, angle: cutAngle, life: 0.16 };
-  if (shakeEnabled) trauma = Math.min(1, trauma + 0.42);
-  impactZoom = Math.max(impactZoom, shakeEnabled ? 0.018 : 0);
-  hitStopUntil = Math.max(hitStopUntil, now + 52);
+  if (shakeEnabled && special) {
+    trauma = Math.min(0.6, trauma + 0.26);
+    impactZoom = Math.max(impactZoom, 0.014);
+    hitStopUntil = Math.max(hitStopUntil, performance.now() + 30);
+  }
   audio.playSlice(target.kind as FruitSound);
+  if (special) audio.playCue('special');
 }
 
 function onBombHit(target: Target, cutAngle: number): void {
-  lives = Math.max(0, lives - 1);
+  const arcade = roundMode === 'arcade';
+  if (arcade) score = Math.max(0, score - 30);
+  else lives = Math.max(0, lives - 1);
   combo = 0;
+  comboUntil = 0;
+  swingHits = 0;
   flowCharge = 0;
   flowUntil = 0;
   flowWasActive = false;
   updateFlowHud();
   updateHud();
   burstBomb(target);
-  addEffectText(target, lives > 0 ? '生命 -1' : '本局结束', '#ffb08f');
+  addEffectText(target, arcade ? '−30 分' : lives > 0 ? '护盾 −1' : '本局结束', '#ffb08f');
   slashFx = { x: target.x, y: target.y, angle: cutAngle, life: 0.22 };
-  if (shakeEnabled) trauma = 1;
-  impactZoom = Math.max(impactZoom, shakeEnabled ? 0.042 : 0);
-  hitStopUntil = Math.max(hitStopUntil, performance.now() + 125);
+  if (shakeEnabled) {
+    trauma = 0.78;
+    impactZoom = Math.max(impactZoom, 0.025);
+    hitStopUntil = Math.max(hitStopUntil, performance.now() + 85);
+  }
   audio.playBomb();
-  holdStatus(lives > 0 ? `炸弹！还剩 ${lives} 条生命` : '炸弹引爆了本局', 1100);
+  holdStatus(arcade ? '炸弹命中 · 扣 30 分' : `炸弹命中 · 剩余 ${lives} 个护盾`, 1100);
 
   if (lives === 0) {
     active = false;
+    $<HTMLButtonElement>('pause').disabled = true;
+    clearBlade();
     const finishedRun = runId;
     window.setTimeout(() => {
-      if (runId === finishedRun && lives === 0) finishGame();
+      if (runId === finishedRun && lives === 0) finishGame('护盾耗尽');
     }, 170);
   }
 }
 
 function slice(point: Point, enabled: boolean, at: number): void {
+  if (!active || pauseMenu.open || document.hidden) return;
   cursor = point;
   if (!enabled) {
     previous = null;
-    trail = [];
+    swingHits = 0;
     return;
   }
 
-  if (previous && at - previous.t < 150) {
-    const speed = Math.hypot(point.x - previous.x, point.y - previous.y) / Math.max(0.001, (at - previous.t) / 1000);
-    if (speed > 90) {
-      const cutAngle = Math.atan2(point.y - previous.y, point.x - previous.x);
-      const hits = fruits.filter((target) => target.state === 'whole' && intersects(previous!, point, target, target.r + 8));
-      for (const target of hits) {
-        const index = fruits.indexOf(target);
-        if (index < 0) continue;
-        fruits.splice(index, 1);
-        if (target.kind === 'bomb') onBombHit(target, cutAngle);
-        else onFruitCut(target, cutAngle);
-      }
-    }
+  const sample = { ...point, t: at };
+  const start = previous;
+  previous = sample;
+  if (!start) return;
+  const elapsed = at - start.t;
+  const gesture = mode === 'camera' || mode === 'bot';
+  const jumped = gesture && Math.hypot(point.x - start.x, point.y - start.y) > Math.hypot(width, height) * 0.34;
+  if (elapsed >= 120 || jumped) {
+    trail = [];
+    swingHits = 0;
+    return;
   }
 
-  previous = { ...point, t: at };
-  trail.push({ ...point, t: at });
+  const minSpeed = gesture ? Math.max(125, width * 0.27) : 90;
+  if (bladeSpeed(start, sample) <= minSpeed) return;
+  if (at - lastFastSample >= 150) swingHits = 0;
+  if (at - lastFastSample > 48) trail = [start];
+  trail.push(sample);
+  lastFastSample = at;
+
+  if (calibrating) {
+    calibrating = false;
+    handSeenAt = performance.now();
+    holdStatus('校准完成 · 开始切水果');
+    clearBlade();
+    return;
+  }
+  const cutAngle = Math.atan2(point.y - start.y, point.x - start.x);
+  const hits = fruits.flatMap((target) => {
+    if (target.state !== 'whole') return [];
+    const time = hitTime(start, point, target, target.r + 8);
+    return time === null ? [] : [{ target, time }];
+  }).sort((a, b) => a.time - b.time || a.target.id - b.target.id);
+  for (const { target } of hits) {
+    if (!active) break;
+    fruits.splice(fruits.indexOf(target), 1);
+    if (target.kind === 'bomb') onBombHit(target, cutAngle);
+    else onFruitCut(target, cutAngle);
+  }
 }
 
 function updateSkeleton(frame: GestureFrame): void {
@@ -696,19 +855,23 @@ const handOptions = {
   camera: { audio: false, video: true } as MediaStreamConstraints,
   config: { pose: { experimental: false } },
   onFrame(frame: GestureFrame) {
-    updateSkeleton(frame);
-    if (!active || (mode !== 'camera' && mode !== 'bot')) return;
+    if (!active || pauseMenu.open || (mode !== 'camera' && mode !== 'bot')) return;
+    if (mode === 'camera' && previewEnabled) updateSkeleton(frame);
     const hand = frame.hands[0];
     if (!hand) {
+      gestureId = null;
       clearBlade();
-      if (performance.now() >= statusHoldUntil) setStatus('未检测到手 · 请将手掌朝向镜头');
+      if (performance.now() >= statusHoldUntil) setStatus(calibrating ? '校准 · 请将手掌朝向镜头' : '未检测到手 · 请将手掌朝向镜头');
       return;
     }
+    handSeenAt = performance.now();
+    if (gestureId !== hand.id) clearBlade();
+    gestureId = hand.id;
     const point = toScreen(hand.landmarks[8], GESTURE_REGION);
     const cutting = hand.features.curl[1] < 0.55 && hand.pose !== 'fist';
     slice({ x: point.x * width, y: point.y * height }, cutting, performance.now());
     if (performance.now() >= statusHoldUntil) {
-      setStatus(cutting ? '食指刀光已就绪 · 挥动切割' : '伸直食指开刀 · 握拳收刀');
+      setStatus(calibrating ? '校准 · 伸直食指试挥一次' : cutting ? '食指刀光已就绪 · 挥动切割' : '伸直食指开刀 · 握拳收刀');
     }
   },
 };
@@ -717,20 +880,26 @@ let hands = createHands(handOptions);
 
 function resetHands(): void {
   hands.stop();
+  video.srcObject = null;
   hands = createHands(handOptions);
 }
 
-function spawnTarget(forceBomb = false): void {
-  if (fruits.filter((target) => target.state === 'whole').length >= 5) return;
-  const bomb = forceBomb || (score >= 3 && Math.random() < 0.14);
+function spawnTarget(forceBomb = false, lane?: number, fruitOnly = false): void {
+  if (!forceBomb && fruits.filter((target) => target.state === 'whole').length >= MAX_WHOLE_TARGETS) return;
+  const arcade = roundMode === 'arcade';
+  const bombEligible = !fruitOnly && (arcade ? roundTime >= 8000 : score >= 3);
+  // More waves per second, with a lower bomb chance per eligible wave.
+  const bomb = forceBomb || (bombEligible && Math.random() < 0.15 * SPAWN_INTERVAL_SCALE);
   const kind: TargetKind = bomb ? 'bomb' : FRUIT_KINDS[Math.floor(Math.random() * FRUIT_KINDS.length)];
+  const rareRoll = arcade && !bomb && roundTime >= 12_000 ? Math.random() : 1;
   fruits.push({
     id: nextTargetId++,
     kind,
-    x: width * (bomb ? 0.32 + Math.random() * 0.36 : 0.22 + Math.random() * 0.56),
+    x: width * (lane ?? (bomb ? 0.32 + Math.random() * 0.36 : 0.22 + Math.random() * 0.56)),
+    rarity: rareRoll < 0.055 ? 'gold' : rareRoll < 0.095 && roundTime >= iceUntil ? 'ice' : undefined,
     y: height + 54,
-    vx: (Math.random() - 0.5) * 120,
-    vy: -Math.sqrt(2 * 520 * height * (0.7 + Math.random() * 0.12)),
+    vx: (Math.random() - 0.5) * Math.min(width * (lane === undefined ? 0.22 : 0.04), 120),
+    vy: -Math.sqrt(2 * 520 * height * (0.7 + Math.random() * (lane === undefined ? 0.12 : 0.025))),
     r: bomb ? Math.min(34, width * 0.045) : Math.min(38, width * 0.055),
     angle: Math.random() * Math.PI * 2,
     spin: Math.random() * 2 - 1,
@@ -741,10 +910,41 @@ function spawnTarget(forceBomb = false): void {
   });
 }
 
+function setMode(next: Mode): void {
+  mode = next;
+  calibrating = next === 'camera' && roundTime === 0;
+  handSeenAt = performance.now();
+  gestureId = null;
+  activePointer = null;
+  keys.clear();
+  clearBlade();
+  syncModeButtons();
+  $('preview-toggle').hidden = next !== 'camera';
+  preview.style.display = next === 'camera' && previewEnabled ? 'block' : 'none';
+  $<HTMLButtonElement>('stop').hidden = next !== 'camera';
+  setStatus(next === 'mouse'
+    ? (mobileDevice ? '触屏控制 · 按住拖动切割' : '鼠标控制 · 按住划动切割')
+    : calibrating ? '校准 · 伸直食指试挥一次' : '手势控制 · 伸直食指挥动');
+}
+
+function setMenuOpen(open: boolean): void {
+  $('stage').classList.toggle('menu-open', open);
+  canvas.inert = open;
+  for (const overlay of document.querySelectorAll<HTMLElement>('.topline, .bottomline')) overlay.inert = open;
+}
+
 function begin(next: Mode): void {
   runId += 1;
-  mode = next;
   active = true;
+  if (pauseMenu.open) pauseMenu.close();
+  $<HTMLButtonElement>('pause').disabled = false;
+  roundTime = 0;
+  lastTimer = -1;
+  iceUntil = 0;
+  last = performance.now();
+  cutCount = maxStreak = maxSwing = 0;
+  activePointer = null;
+  keys.clear();
   score = 0;
   lives = 3;
   combo = 0;
@@ -762,25 +962,74 @@ function begin(next: Mode): void {
   lastFlowRunning = false;
   ambientLeaves = [];
   nextLeafAt = 0;
-  spawnAt = performance.now() + 250;
-  clearBlade();
+  spawnAt = 250;
+  slashFx = null;
+  statusHoldUntil = 0;
+  setMode(next);
+  updateTimer();
   updateHud();
   updateFlowHud();
   $('welcome').style.display = 'none';
   $('gameover').hidden = true;
-  syncModeButtons();
-  setStatus(next === 'mouse'
-    ? (mobileDevice ? '触屏控制 · 按住拖动切割' : '鼠标控制 · 按住划动切割')
-    : '手势控制 · 小幅度移动即可覆盖全场');
+  setMenuOpen(false);
+  canvas.focus({ preventScroll: true });
 }
 
-function finishGame(): void {
+function finishGame(reason: string): void {
   active = false;
   clearBlade();
-  $('final-score').textContent = `切开 ${score} 个水果`;
-  $('final-note').textContent = score >= 12 ? '刀光很利落，再来挑战更高的连击。' : '炸弹耗尽了你的生命。';
+  $<HTMLButtonElement>('pause').disabled = true;
+  const record = score > best && mode !== 'bot';
+  if (record) {
+    best = score;
+    savePreference('best:' + roundMode, String(best));
+    updateHud();
+  }
+  $('final-score').textContent = `${score} 分${record ? ' · 新纪录' : ''}`;
+  $('final-note').textContent = `${reason} · 切开 ${cutCount} 个 · 最长连续命中 ${maxStreak} · 单刀最多 ${maxSwing} 个`;
   $('gameover').hidden = false;
+  setMenuOpen(true);
+  $('again').focus();
 }
+
+function showMenu(): void {
+  runId += 1;
+  if (!startingCamera) resetHands();
+  active = false;
+  if (pauseMenu.open) pauseMenu.close();
+  activePointer = null;
+  keys.clear();
+  setMode('none');
+  roundTime = 0;
+  updateTimer();
+  setStatus('等待开始');
+  $<HTMLButtonElement>('pause').disabled = true;
+  $('welcome').style.display = 'flex';
+  $('gameover').hidden = true;
+  $('error').textContent = '';
+  setMenuOpen(true);
+  $(roundMode).focus();
+}
+
+function pauseGame(reason = '游戏暂停'): void {
+  if (!active || pauseMenu.open) return;
+  clearBlade();
+  keys.clear();
+  activePointer = null;
+  $('pause-title').textContent = reason;
+  pauseMenu.showModal();
+}
+
+pauseMenu.addEventListener('close', () => {
+  last = performance.now();
+  handSeenAt = last;
+  if (active) canvas.focus({ preventScroll: true });
+});
+$('pause').onclick = () => pauseGame();
+$('resume').onclick = () => pauseMenu.close();
+$('pause-exit').onclick = $('result-menu').onclick = showMenu;
+$('arcade').onclick = () => selectRound('arcade');
+$('classic').onclick = () => selectRound('classic');
 
 async function refreshDevices(): Promise<void> {
   try {
@@ -804,14 +1053,11 @@ $<HTMLButtonElement>('camera').onclick = async () => {
   startingCamera = true;
   void audio.unlock();
   const button = $<HTMLButtonElement>('camera');
-  const mouseButton = $<HTMLButtonElement>('mouse');
   const device = $<HTMLSelectElement>('device');
-  button.disabled = mouseButton.disabled = device.disabled = true;
+  button.disabled = device.disabled = true;
   button.textContent = '正在打开摄像头…';
   $('error').textContent = '';
-  const preview = document.querySelector('.preview') as HTMLElement;
-  preview.style.display = 'block';
-  preview.style.visibility = 'hidden';
+  const cameraRun = runId;
 
   try {
     const selected = device.value;
@@ -828,24 +1074,36 @@ $<HTMLButtonElement>('camera').onclick = async () => {
     try {
       await hands.startCamera();
     } catch (first) {
+      if (cameraRun !== runId) throw first;
       if (!['NotReadableError', 'OverconstrainedError', 'TrackStartError'].includes((first as Error).name)) throw first;
       resetHands();
       handOptions.camera = { audio: false, video: selected ? { deviceId: { exact: selected } } : true };
       await new Promise((resolve) => window.setTimeout(resolve, 600));
-      await hands.startCamera();
+      if (cameraRun === runId) await hands.startCamera();
+    }
+    if (cameraRun !== runId) {
+      resetHands();
+      return;
+    }
+    const stream = video.srcObject;
+    if (!(stream instanceof MediaStream) || !stream.getVideoTracks().some((track) => track.readyState === 'live')) {
+      throw new DOMException('Camera stream is unavailable', 'NotReadableError');
     }
     hands.inject(null);
-    begin('camera');
-    preview.style.visibility = 'visible';
+    if (active) {
+      setMode('camera');
+      if (!pauseMenu.open) canvas.focus({ preventScroll: true });
+    } else begin('camera');
     preview.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
     hands.tracker.onEnded = () => {
-      clearBlade();
-      $('stop').click();
-      $('error').textContent = '摄像头连接已断开，请检查设备后重试。';
+      resetHands();
+      setMode('mouse');
+      holdStatus('摄像头已断开 · 已切换备用控制', 2500);
     };
-    await refreshDevices();
+    void refreshDevices();
   } catch (error) {
     resetHands();
+    if (cameraRun !== runId) return;
     preview.style.display = 'none';
     $('error').textContent = cameraError(error);
     if (mode === 'mouse') holdStatus('无法开启摄像头 · 保持鼠标控制', 1800);
@@ -853,24 +1111,26 @@ $<HTMLButtonElement>('camera').onclick = async () => {
     await refreshDevices();
   } finally {
     startingCamera = false;
-    button.disabled = mouseButton.disabled = device.disabled = false;
+    button.disabled = device.disabled = false;
     button.textContent = '开启摄像头';
   }
 };
 
 $('mouse').onclick = () => {
   void audio.unlock();
-  resetHands();
+  if (!startingCamera) resetHands();
   begin('mouse');
 };
 
 $('mode-mouse').onclick = () => {
-  if (mode === 'mouse') return;
-  if (mode === 'camera' || mode === 'bot') {
-    resetHands();
-    (document.querySelector('.preview') as HTMLElement).style.display = 'none';
-  }
-  begin('mouse');
+  if (mode === 'mouse' && !startingCamera) return;
+  if (startingCamera) runId += 1;
+  void audio.unlock();
+  if (!startingCamera) resetHands();
+  if (active) {
+    setMode('mouse');
+    canvas.focus({ preventScroll: true });
+  } else begin('mouse');
 };
 
 $('mode-camera').onclick = () => {
@@ -878,22 +1138,17 @@ $('mode-camera').onclick = () => {
   $<HTMLButtonElement>('camera').click();
 };
 
-$('stop').onclick = () => {
-  resetHands();
-  active = false;
-  mode = 'none';
-  clearBlade();
-  (document.querySelector('.preview') as HTMLElement).style.display = 'none';
-  $('welcome').style.display = 'flex';
-  $('gameover').hidden = true;
-  syncModeButtons();
-  setStatus('摄像头已停止');
+$('stop').onclick = showMenu;
+$('preview-toggle').onclick = () => {
+  previewEnabled = !previewEnabled;
+  preview.style.display = previewEnabled ? 'block' : 'none';
+  toggleEffect('preview-toggle', previewEnabled);
 };
 
 $('reset').onclick = () => begin(mode === 'none' ? 'mouse' : mode);
 $('again').onclick = () => begin(mode === 'none' ? 'mouse' : mode);
 
-function toggleEffect(id: 'sound-toggle' | 'shake-toggle', enabled: boolean): void {
+function toggleEffect(id: string, enabled: boolean): void {
   const button = $<HTMLButtonElement>(id);
   button.classList.toggle('active', enabled);
   button.setAttribute('aria-pressed', String(enabled));
@@ -904,31 +1159,44 @@ $('sound-toggle').onclick = () => {
   audio.setMuted(!soundEnabled);
   if (soundEnabled) void audio.unlock();
   toggleEffect('sound-toggle', soundEnabled);
+  savePreference('sound', soundEnabled ? 'on' : 'off');
 };
 $('shake-toggle').onclick = () => {
   shakeEnabled = !shakeEnabled;
-  if (!shakeEnabled) trauma = 0;
+  if (!shakeEnabled) trauma = impactZoom = hitStopUntil = 0;
   toggleEffect('shake-toggle', shakeEnabled);
+  $('stage').classList.toggle('reduced-fx', !shakeEnabled);
+  savePreference('motion', shakeEnabled ? 'on' : 'off');
 };
 function pointer(event: PointerEvent): void {
-  if (mode !== 'mouse' || !active) return;
+  if (mode !== 'mouse' || !active || (activePointer !== null && event.pointerId !== activePointer)) return;
   const rect = canvas.getBoundingClientRect();
-  slice({ x: event.clientX - rect.left, y: event.clientY - rect.top }, pressed, performance.now());
+  slice({ x: event.clientX - rect.left, y: event.clientY - rect.top }, activePointer !== null, event.timeStamp);
 }
 
 canvas.onpointerdown = (event) => {
-  pressed = true;
+  if (mode !== 'mouse' || !active || pauseMenu.open || activePointer !== null || event.button !== 0) return;
+  clearBlade();
+  activePointer = event.pointerId;
   canvas.setPointerCapture(event.pointerId);
   void audio.unlock();
   pointer(event);
 };
 canvas.onpointermove = pointer;
-canvas.onpointerup = canvas.onpointercancel = () => {
-  pressed = false;
+canvas.onpointerup = canvas.onpointercancel = canvas.onlostpointercapture = (event) => {
+  if (event.pointerId !== activePointer) return;
+  activePointer = null;
   previous = null;
+  swingHits = 0;
 };
 
 window.addEventListener('keydown', (event) => {
+  if (event.code === 'Escape' && active && !pauseMenu.open) {
+    event.preventDefault();
+    pauseGame();
+    return;
+  }
+  if (mode !== 'mouse' || !active || pauseMenu.open || (event.target instanceof HTMLElement && event.target.closest('button, select, a'))) return;
   if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(event.code)) {
     event.preventDefault();
     keys.add(event.code);
@@ -937,43 +1205,88 @@ window.addEventListener('keydown', (event) => {
 window.addEventListener('keyup', (event) => keys.delete(event.code));
 window.addEventListener('blur', () => {
   keys.clear();
-  pressed = false;
+  activePointer = null;
   clearBlade();
 });
 document.addEventListener('visibilitychange', () => {
   clearBlade();
   keys.clear();
-  pressed = false;
+  activePointer = null;
   last = performance.now();
+  if (document.hidden) pauseGame();
 });
-window.addEventListener('pagehide', () => hands.stop());
+window.addEventListener('pagehide', () => {
+  runId += 1;
+  if (!startingCamera) {
+    hands.stop();
+    video.srcObject = null;
+  }
+});
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted && mode === 'camera') {
+    setMode('mouse');
+    holdStatus('已切换备用控制，可重新开启摄像头');
+  }
+});
+
+function resizeArena(): void {
+  const rect = canvas.getBoundingClientRect();
+  pixelRatio = Math.min(devicePixelRatio, 2);
+  if (rect.width < 2 || rect.height < 2) return;
+  if (width !== rect.width || height !== rect.height) {
+    for (const target of fruits) {
+      target.x *= rect.width / width;
+      target.y *= rect.height / height;
+    }
+  }
+  width = rect.width;
+  height = rect.height;
+  canvas.width = Math.round(width * pixelRatio);
+  canvas.height = Math.round(height * pixelRatio);
+  paintOrchard(scenery, width, height, Math.min(pixelRatio, 1.5));
+  clearBlade();
+}
 
 function render(now: number): void {
   requestAnimationFrame(render);
-  const realDt = Math.min(0.04, Math.max(0, (now - last) / 1000));
-  const gameDt = now < hitStopUntil ? 0 : realDt;
+  const elapsed = Math.max(0, now - last);
+  if (mode === 'camera' && !calibrating && now - handSeenAt >= 2200) pauseGame('手势失去跟踪');
+  const running = active && !calibrating && !pauseMenu.open && !document.hidden;
+  const realDt = Math.min(0.04, elapsed / 1000);
+  const gameDt = running && now >= hitStopUntil ? realDt : 0;
   last = now;
 
-  const rect = canvas.getBoundingClientRect();
-  const dpr = Math.min(devicePixelRatio, 2);
-  width = rect.width;
-  height = rect.height;
+  if (Math.min(devicePixelRatio, 2) !== pixelRatio) resizeArena();
   if (width < 2 || height < 2) return;
-  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
-    clearBlade();
-  }
-
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  if (active && !document.hidden && gameDt > 0) {
-    if (now > spawnAt) {
-      spawnTarget();
-      spawnAt = now + Math.max(660, 930 - score * 7);
+  if (running) {
+    roundTime += elapsed;
+    updateTimer();
+    if (roundMode === 'arcade' && roundTime >= ARCADE_DURATION) finishGame('时间到');
+  }
+
+  if (active && gameDt > 0) {
+    if (roundTime >= spawnAt) {
+      let interval: number;
+      if (roundMode === 'arcade') {
+        const progress = Math.min(1, roundTime / ARCADE_DURATION);
+        if (roundTime > 5000 && Math.random() < 0.45 + progress * 0.45) {
+          const count = roundTime > 13_000 ? 3 : 2;
+          const offset = (Math.random() - 0.5) * 0.10;
+          for (let index = 0; index < count; index++) {
+            spawnTarget(false, 0.5 + offset + (index - (count - 1) / 2) * 0.23, true);
+          }
+        } else spawnTarget();
+        interval = (1050 - 400 * progress) * (isFlowActive() ? 0.79 : 1);
+      } else {
+        spawnTarget();
+        interval = Math.max(660, 930 - score * 7);
+      }
+      spawnAt = roundTime + interval * SPAWN_INTERVAL_SCALE;
     }
-    if (mode === 'mouse' && keys.size) {
+    if (mode === 'mouse' && keys.size && activePointer === null) {
       const point = cursor ?? { x: width / 2, y: height / 2 };
       slice({
         x: Math.max(0, Math.min(width, point.x + (
@@ -989,18 +1302,19 @@ function render(now: number): void {
       const point = fruit
         ? fromScreen({
             x: Math.max(0, Math.min(1, (fruit.x + Math.sin(now / 65) * 58) / width)),
-            y: Math.max(0, Math.min(1, fruit.y / height + 0.08)),
-          })
+            y: Math.max(0, Math.min(1, fruit.y / height)),
+          }, GESTURE_REGION)
         : { x: 0.5, y: 0.95 };
       hands.inject([syntheticHand(point.x, point.y, P.point)]);
     }
 
     for (const fruit of fruits) {
-      fruit.vy += 520 * gameDt;
-      fruit.x += fruit.vx * gameDt;
-      fruit.y += fruit.vy * gameDt;
-      fruit.angle += fruit.spin * gameDt;
-      fruit.life -= gameDt;
+      const fruitDt = roundTime < iceUntil && fruit.state === 'whole' && fruit.kind !== 'bomb' ? gameDt * 0.55 : gameDt;
+      fruit.vy += 520 * fruitDt;
+      fruit.x += fruit.vx * fruitDt;
+      fruit.y += fruit.vy * fruitDt;
+      fruit.angle += fruit.spin * fruitDt;
+      fruit.life -= fruitDt;
     }
     fruits = fruits.filter((fruit) => fruit.y < height + 120 && fruit.life > 0);
 
@@ -1012,18 +1326,18 @@ function render(now: number): void {
       particle.vx *= 1 - Math.min(0.9, gameDt * 1.6);
     }
     particles = particles.filter((particle) => particle.life > 0);
-    updateAmbient(gameDt, now);
+    if (shakeEnabled) updateAmbient(gameDt, now);
   }
 
   trauma = Math.max(0, trauma - realDt * 1.55);
   impactZoom = Math.max(0, impactZoom - realDt * 0.16);
-  if (combo && now > comboUntil) combo = 0;
-  if (flowWasActive && !isFlowActive(now)) {
+  if (combo && roundTime > comboUntil) combo = 0;
+  if (flowWasActive && !isFlowActive()) {
     flowWasActive = false;
     flowCharge = 0;
     if (active) holdStatus('流光耗尽 · 继续连击重新蓄能', 1200);
   }
-  updateFlowHud(now);
+  updateFlowHud();
 
   const shake = shakeEnabled ? trauma * trauma : 0;
   const shakeX = shake * (Math.sin(now * 0.052) * 10 + Math.sin(now * 0.097 + 1.7) * 4);
@@ -1036,16 +1350,16 @@ function render(now: number): void {
   ctx.scale(zoom, zoom);
   ctx.translate(-width / 2 + shakeX, -height / 2 + shakeY);
 
-  drawAmbient();
+  if (shakeEnabled) drawAmbient();
 
   if (slashFx) {
     slashFx.life -= realDt;
-    if (slashFx.life > 0) {
+    if (slashFx.life > 0 && shakeEnabled) {
       ctx.save();
       ctx.translate(slashFx.x, slashFx.y);
       ctx.rotate(slashFx.angle);
       ctx.globalAlpha = Math.max(0, slashFx.life / 0.16);
-      ctx.strokeStyle = isFlowActive(now) ? 'rgba(112,255,204,.5)' : 'rgba(255,146,77,.45)';
+      ctx.strokeStyle = isFlowActive() ? 'rgba(112,255,204,.5)' : 'rgba(79,232,239,.5)';
       ctx.lineWidth = 20;
       ctx.lineCap = 'round';
       ctx.beginPath();
@@ -1079,6 +1393,10 @@ function render(now: number): void {
     ctx.font = '900 22px Georgia, "Microsoft YaHei", sans-serif';
     ctx.translate(effect.x, effect.y - progress * 42);
     ctx.scale(scale, scale);
+    ctx.strokeStyle = '#102a2b';
+    ctx.lineWidth = 3;
+    ctx.lineJoin = 'round';
+    ctx.strokeText(effect.text, 0, 0);
     ctx.fillText(effect.text, 0, 0);
     ctx.restore();
   }
@@ -1095,6 +1413,14 @@ function render(now: number): void {
   ctx.restore();
 }
 
+selectRound('classic');
+$('stop').hidden = true;
+$('stage').classList.toggle('reduced-fx', !shakeEnabled);
+toggleEffect('shake-toggle', shakeEnabled);
+toggleEffect('sound-toggle', soundEnabled);
+audio.setMuted(!soundEnabled);
+resizeArena();
+new ResizeObserver(resizeArena).observe(canvas);
 requestAnimationFrame(render);
 if (bot) begin('bot');
 else if (mobileDevice) {
@@ -1118,7 +1444,7 @@ Object.assign(window, {
     audio,
     slice,
     begin,
-    activateFlow: () => activateFlow(performance.now()),
+    activateFlow: () => activateFlow(roundTime),
     spawnBomb: () => spawnTarget(true),
   },
 });

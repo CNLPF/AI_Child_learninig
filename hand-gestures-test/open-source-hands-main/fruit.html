@@ -9,22 +9,23 @@
   <body>
     <header>
       <div class="brand">
-        <small>SUNSET SLICE / ARCADE 01</small>
         <h1>流光果园</h1>
       </div>
       <div class="hud">
-        <span class="score">切片 <strong id="score">0</strong></span>
-        <span class="lives">护盾 <strong id="lives">3</strong></span>
+        <span class="score">得分 <strong id="score">0</strong></span>
+        <span>最佳 <strong id="best">0</strong></span>
+        <span id="timer-stat" hidden>剩余 <strong id="timer">60</strong></span>
+        <span class="lives" id="lives-stat">护盾 <strong id="lives">3</strong></span>
       </div>
     </header>
 
     <main>
-      <section id="stage">
-        <canvas id="game" aria-label="手势切水果游戏区域"></canvas>
+      <section id="stage" class="menu-open">
+        <canvas id="scenery" aria-hidden="true"></canvas>
+        <canvas id="game" tabindex="0" inert aria-label="手势切水果游戏区域"></canvas>
 
-        <div class="topline">
+        <div class="topline" inert>
           <span id="status" role="status">等待开始</span>
-          <span>伸出食指 · 挥动切割 · 避开炸弹</span>
           <div class="mode-switch" role="group" aria-label="控制模式">
             <button id="mode-camera" class="mode-button active" aria-pressed="true">手势控制</button>
             <button id="mode-mouse" class="mode-button" aria-pressed="false">鼠标控制</button>
@@ -39,9 +40,12 @@
         </div>
 
         <div id="welcome">
-          <small>让手指成为刀锋</small>
-          <h2>让刀锋切开暮色。</h2>
-          <p>手掌朝向镜头，伸出食指移动。<br>保持动作小而准，切开水果，避开发光的炸弹。</p>
+          <h2>选择玩法</h2>
+          <div class="round-select" role="group" aria-label="玩法">
+            <button id="arcade" type="button" aria-pressed="false">60 秒街机</button>
+            <button id="classic" type="button" aria-pressed="true">经典护盾</button>
+          </div>
+          <p id="round-rules">避开炸弹，护盾用完时结算。</p>
           <div class="camera-choice">
             <select id="device" aria-label="选择摄像头">
               <option value="">系统默认摄像头</option>
@@ -56,21 +60,28 @@
 
         <div id="gameover" hidden>
           <small>本局结束</small>
-          <h2 id="final-score">切开 0 个水果</h2>
+          <h2 id="final-score">0 分</h2>
           <p id="final-note">炸弹耗尽了你的生命。</p>
-          <button id="again">再来一局</button>
+          <div><button id="again">再来一局</button><button id="result-menu" class="secondary">选择玩法</button></div>
         </div>
+
+        <dialog id="pause-menu" aria-labelledby="pause-title">
+          <h2 id="pause-title">游戏暂停</h2>
+          <div><button id="resume" autofocus>继续</button><button id="pause-exit" class="secondary">选择玩法</button></div>
+        </dialog>
 
         <div class="preview">
           <video id="video" autoplay muted playsinline></video>
           <canvas id="skeleton"></canvas>
         </div>
 
-        <div class="bottomline">
+        <div class="bottomline" inert>
           <span id="hint">按住鼠标或触屏划动；方向键移动，空格切割</span>
           <div class="effect-toggles" aria-label="反馈效果">
             <button id="sound-toggle" class="toggle active" aria-pressed="true">声音</button>
-            <button id="shake-toggle" class="toggle active" aria-pressed="true">震动</button>
+            <button id="shake-toggle" class="toggle active" aria-pressed="true">动效</button>
+            <button id="preview-toggle" class="toggle active" aria-pressed="true" hidden>预览</button>
+            <button id="pause" class="secondary" disabled>暂停</button>
             <button id="stop" class="secondary">停止摄像头</button>
             <button id="reset" class="secondary">重新开始</button>
           </div>
@@ -79,7 +90,6 @@
     </main>
 
     <footer>
-      <span>原创手势街机实验 · 暖色黄昏竞技场</span>
       <a href="/">返回手势追踪</a>
     </footer>
 

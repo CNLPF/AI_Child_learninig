@@ -10,11 +10,11 @@ body{
 }
 header{max-width:1020px;margin:auto;padding:24px 30px 18px;display:flex;align-items:flex-end;justify-content:space-between}
 .brand{position:relative;padding-left:20px}
-.brand::before{content:"";position:absolute;left:0;top:4px;width:5px;height:67px;background:linear-gradient(var(--amber),var(--coral));border-radius:4px}
+.brand::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(var(--amber),var(--coral));border-radius:4px}
 small{color:var(--amber);letter-spacing:3.2px;font-size:10px;font-weight:700;text-transform:uppercase}
 h1{font:700 35px/1.08 Georgia,"Microsoft YaHei",serif;margin:8px 0 0;letter-spacing:0}
 .hud{display:flex;align-items:stretch;gap:0;color:#c8c9aa;font-size:13px}
-.hud>span{display:flex;align-items:center;gap:10px;min-width:122px;padding:0 20px;border-left:1px solid var(--line);white-space:nowrap}
+.hud>span{display:flex;align-items:center;gap:10px;min-width:100px;padding:0 16px;border-left:1px solid var(--line);white-space:nowrap}
 .hud>span:first-child{border-left:0}
 .hud strong{font:700 40px/1 Georgia,serif;color:var(--amber);font-variant-numeric:tabular-nums}
 .lives strong{color:var(--coral)}
@@ -22,22 +22,27 @@ main{max-width:1020px;margin:auto;padding:0 24px}
 #stage{
   position:relative;
   width:min(100%,940px);
-  height:min(67vh,630px);
-  min-height:480px;
+  aspect-ratio:16/9;
+  min-height:460px;
   margin:0 auto;
   border:1px solid rgba(255,213,139,.5);
   border-radius:18px;
   overflow:hidden;
-  background:linear-gradient(155deg,rgba(255,130,75,.2),transparent 27%),linear-gradient(180deg,#1c4f43 0%,#103431 52%,#081d20 100%);
+  background:
+    radial-gradient(ellipse at 66% 0%,rgba(255,188,101,.24),transparent 44%),
+    radial-gradient(ellipse 52% 33% at 4% 74%,#113333 23%,transparent 75%),
+    radial-gradient(ellipse 49% 30% at 98% 79%,#184441 25%,transparent 80%),
+    linear-gradient(180deg,#245653,#123d3d 50%,#092528);
   box-shadow:0 22px 70px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.035);
   touch-action:none;
   isolation:isolate;
 }
 #stage::before{content:"";position:absolute;z-index:0;left:49%;top:-60%;width:34%;height:180%;background:linear-gradient(90deg,transparent,rgba(255,189,99,.075),transparent);transform:rotate(24deg);pointer-events:none}
-#stage::after{content:"";position:absolute;z-index:0;inset:58% 0 0;background:linear-gradient(180deg,rgba(9,27,30,.06),rgba(5,17,20,.34));border-top:1px solid rgba(255,225,167,.08);pointer-events:none}
+#stage::after{content:"";position:absolute;z-index:0;inset:auto -10% 0;height:20%;background:repeating-linear-gradient(0deg,transparent 0 14px,rgba(4,20,20,.26) 15px 17px),linear-gradient(#435b42,#172c28);opacity:.56;pointer-events:none;transform:perspective(115px) rotateX(16deg);transform-origin:bottom}
 #stage.flow-active{border-color:rgba(255,213,120,.86);box-shadow:0 22px 70px rgba(0,0,0,.35),0 0 34px rgba(255,177,83,.16),inset 0 0 46px rgba(255,177,83,.08)}
 #stage.flow-active::before{background:linear-gradient(90deg,transparent,rgba(255,196,104,.17),rgba(255,112,74,.08),transparent);animation:flow-band 2.2s linear infinite}
 @keyframes flow-band{from{transform:translateX(-28%) rotate(24deg)}to{transform:translateX(34%) rotate(24deg)}}
+#scenery{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 #game{position:relative;z-index:1;width:100%;height:100%;display:block}
 .topline,.bottomline{position:absolute;left:24px;right:24px;display:flex;align-items:center;gap:14px;justify-content:space-between;font-size:13px;color:#d3cfad;z-index:3}
 .topline{top:18px;pointer-events:none}
@@ -47,6 +52,7 @@ main{max-width:1020px;margin:auto;padding:0 24px}
 button{cursor:pointer;background:var(--amber);color:#1b2925;border:0;border-radius:8px;font:inherit;font-size:14px;font-weight:700;padding:12px 20px;transition:background .15s,transform .15s,opacity .15s}
 button:hover{background:#ffd58c}
 button:active{transform:translateY(1px)}
+button:disabled{opacity:.55;cursor:default}
 .secondary{background:#173832;color:#eee8c9;border:1px solid #5a7462}
 .secondary:hover{background:#20483f}
 .effect-toggles{display:flex;align-items:center;gap:7px}
@@ -64,8 +70,31 @@ button:active{transform:translateY(1px)}
 #flow-meter.active{border-color:rgba(255,210,121,.75);box-shadow:0 0 22px rgba(255,177,83,.18)}
 #flow-meter.active #flow-label{color:var(--cream);font-weight:700}
 #flow-meter.active #flow-value{color:var(--mint)}
-#welcome,#gameover{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;flex-direction:column;background:rgba(7,25,27,.9);z-index:4;text-align:center;padding:24px}
-#gameover[hidden]{display:none}
+#welcome,#gameover{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;flex-direction:column;background:rgba(7,25,27,.78);z-index:4;text-align:center;padding:24px}
+[hidden]{display:none!important}
+#timer-stat.urgent strong{color:var(--coral)}
+#pause-menu{max-width:calc(100vw - 32px);padding:28px;border:1px solid #638777;border-radius:12px;background:#102c2b;color:var(--cream);text-align:center}
+.menu-open .topline,.menu-open .bottomline,.menu-open #flow-meter,.menu-open .preview{visibility:hidden}
+#pause-menu::backdrop{background:rgba(4,16,19,.74)}
+#pause-menu h2{margin:0 0 20px}
+#pause-menu button+button{margin-left:8px}
+.round-select{display:flex;gap:4px;padding:4px;border:1px solid #537568;border-radius:12px;background:#0b2322}
+#welcome .round-select button{margin:0;background:transparent;color:var(--cream);transition:none}
+#welcome .round-select button[aria-pressed="true"]{background:#f5d88e;color:#163934}
+:focus-visible{outline:2px solid #b5f9ee;outline-offset:3px}
+#game:focus-visible{outline-offset:-4px}
+#stage.reduced-fx::before{animation:none}
+#stage.reduced-fx #flow-fill,#stage.reduced-fx #flow-meter{transition:none}
+@media (max-width:440px){
+  header{flex-wrap:wrap;gap:10px}
+  .hud{margin-left:auto}
+}
+@media (max-height:520px) and (orientation:landscape){
+  body main #stage{min-height:340px}
+  #welcome{padding:10px}
+  #welcome h2{font-size:25px;margin:4px 0}
+  #welcome p{margin:4px 0}
+}
 #welcome h2,#gameover h2{font:700 clamp(29px,4vw,54px)/1.12 Georgia,"Microsoft YaHei",serif;margin:17px 0 9px;color:var(--cream)}
 #welcome p,#gameover p{line-height:1.8;color:#c6cdb1;margin:8px 0 12px}
 #welcome button,#gameover button{margin:6px}
@@ -73,23 +102,21 @@ button:active{transform:translateY(1px)}
 #error{color:#ffac8e!important;max-width:520px}
 .camera-choice{display:flex;gap:8px;align-items:center;max-width:100%}
 .camera-choice select{min-width:0;max-width:240px;background:#15362f;color:#f4ebca;border:1px solid #647b65;border-radius:8px;padding:11px;font:inherit}
-.preview{display:none;position:absolute;right:22px;top:62px;width:176px;aspect-ratio:4/3;border:1px solid #a89b70;border-radius:9px;overflow:hidden;background:#061619;z-index:2;box-shadow:0 6px 24px rgba(0,0,0,.24)}
+.preview{display:none;position:absolute;right:22px;bottom:66px;width:148px;aspect-ratio:4/3;border:1px solid #a89b70;border-radius:9px;overflow:hidden;background:#061619;z-index:2;box-shadow:0 6px 24px rgba(0,0,0,.24)}
 .preview video,.preview canvas{width:100%;height:100%;position:absolute;inset:0}
 .preview video{transform:scaleX(-1)}
-footer{max-width:1020px;margin:18px auto;padding:0 30px;color:#8fa18c;font-size:12px;display:flex;justify-content:space-between}
+footer{max-width:1020px;margin:18px auto;padding:0 30px;color:#8fa18c;font-size:12px;text-align:right}
 a{color:var(--amber);text-decoration:none}
 a:hover{text-decoration:underline}
 @media(max-width:760px){
   header{padding:16px 20px 12px}
   .brand{padding-left:14px}
-  .brand::before{height:59px}
   h1{font-size:30px}
   .hud{gap:2px}
   .hud>span{min-width:auto;padding:0 8px;gap:5px;font-size:11px}
   .hud strong{font-size:30px}
   .lives strong{font-size:27px}
   .topline{left:10px;right:10px}
-  .topline>span:nth-child(2){display:none}
   .mode-switch{position:absolute;right:0;top:39px}
   .mode-button{padding:6px 8px;font-size:10px}
   #flow-meter{left:10px;top:88px;width:154px;padding:7px 9px 8px}
@@ -98,9 +125,8 @@ a:hover{text-decoration:underline}
   #hint{display:none}
   .effect-toggles{width:100%;justify-content:flex-end;flex-wrap:wrap}
   .toggle,.bottomline button{padding:7px 10px;font-size:11px}
-  .preview{width:104px}
+  .preview{width:104px;bottom:70px}
   main{padding:0 10px}
   #stage{width:100%;height:calc(100vh - 150px);min-height:430px}
   footer{padding:0 20px}
-  footer span{display:none}
 }

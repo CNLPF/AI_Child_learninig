@@ -1,10 +1,12 @@
-export type FruitSound = 'apple' | 'orange' | 'lime' | 'watermelon';
+export type FruitSound = 'apple' | 'orange' | 'lime' | 'watermelon' | 'strawberry' | 'kiwi';
 
 const BASE_PITCH: Record<FruitSound, number> = {
   apple: 520,
   orange: 430,
   lime: 610,
   watermelon: 590,
+  strawberry: 660,
+  kiwi: 480,
 };
 
 export class GameAudio {
@@ -83,7 +85,7 @@ export class GameAudio {
 
   playBomb(): void {
     const context = this.ready();
-    if (!context || !this.noise || !this.sfx) return;
+    if (!context || !this.noise || !this.sfx || this.activeVoices >= 12) return;
     const now = context.currentTime + 0.002;
     const stopAt = now + 0.62;
 
@@ -136,6 +138,26 @@ export class GameAudio {
       oscillator.start(start);
       oscillator.stop(end);
     });
+  }
+
+  playCue(cue: 'combo' | 'special' | 'countdown'): void {
+    const context = this.ready();
+    if (!context || !this.sfx || this.activeVoices >= 12) return;
+    const start = context.currentTime + 0.004;
+    const end = start + 0.14;
+    const oscillator = context.createOscillator();
+    oscillator.type = 'sine';
+    const pitch = { combo: 740, special: 660, countdown: 440 }[cue];
+    oscillator.frequency.setValueAtTime(pitch, start);
+    if (cue !== 'countdown') oscillator.frequency.setValueAtTime(pitch * 1.5, start + 0.045);
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.075, start + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    oscillator.connect(gain).connect(this.sfx);
+    this.trackVoice(oscillator);
+    oscillator.start(start);
+    oscillator.stop(end);
   }
 
   private ready(): AudioContext | undefined {
